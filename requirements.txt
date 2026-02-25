@@ -1,6 +1,8 @@
 fastapi
 uvicorn
+apscheduler
 pydantic
+tzdata
 supabase
 passlib
 bcrypt
