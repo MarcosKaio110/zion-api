@@ -1,6 +1,5 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from passlib.context import CryptContext
 from supabase import create_client, Client
 import uvicorn
 import os
@@ -8,7 +7,7 @@ import uuid
 import hashlib
 from typing import Optional
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# Sem passlib, sem bcrypt! Apenas o núcleo duro do Python.
 SUPABASE_URL = "https://vnkmsteysjkqzeivhfij.supabase.co"
 SUPABASE_KEY = "sb_publishable_ws-6h46BFv0RXGDPTjmjsA_nuk-79RO"
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -29,8 +28,8 @@ class TransferRequest(BaseModel):
     destinatario: str
     quantidade: float
 
-# O Funil SHA-256 que esmaga o lixo invisível
-def pre_hash(password: str):
+# Nossa nova armadura de criptografia (sem limites de 72 bytes)
+def pure_hash(password: str):
     return hashlib.sha256(password.encode('utf-8', errors='ignore')).hexdigest()
 
 @app.post("/auth/register")
@@ -42,16 +41,17 @@ def register(user: UserAuth):
     nova_wallet = "0x" + str(uuid.uuid4().hex)[:8].upper()
 
     try:
-        hashed_pw = pwd_context.hash(pre_hash(user.password))
+        senha_blindada = pure_hash(user.password)
         supabase.table("usuarios").insert({
             "wallet_hash": nova_wallet,
             "username": clean_name,
-            "password_hash": hashed_pw,
+            "password_hash": senha_blindada,
             "saldo": 0.0
         }).execute()
         return {"status": "Registrado com sucesso!", "username": clean_name, "wallet_hash": nova_wallet}
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Erro Banco: {str(e)}")
+        # Mudamos a mensagem para "Erro Zion" para termos a prova visual do novo deploy
+        raise HTTPException(status_code=400, detail=f"Erro Zion: {str(e)}")
 
 @app.post("/auth/login")
 def login(user: UserAuth):
@@ -64,7 +64,7 @@ def login(user: UserAuth):
         raise HTTPException(status_code=404, detail="Usuário não encontrado.")
 
     db_user = res.data[0]
-    if not pwd_context.verify(pre_hash(user.password), db_user["password_hash"]):
+    if pure_hash(user.password) != db_user["password_hash"]:
         raise HTTPException(status_code=401, detail="Senha incorreta.")
 
     return {
