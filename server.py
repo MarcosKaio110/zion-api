@@ -2,23 +2,42 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from apscheduler.schedulers.background import BackgroundScheduler
 import uvicorn
+import json
+import os
 
-app = FastAPI(title="Zion Gateway V2 - SNG Protocol")
+app = FastAPI(title="Zion Gateway V2.1 - SNG Protocol")
 
-# --- O BANCO DE DADOS (Ledger + Registro Civil) ---
-ledger = {
-    "0xF497FFEB": 0.0000  # Carteira Oficial
-}
+# --- SISTEMA DE PERSISTÊNCIA (O DISCO RÍGIDO DA MATRIX) ---
+DB_FILE = "zion_db.json"
 
-# Novo dicionário para mapear nomes de usuário para as carteiras
-aliases = {
-    "@arquiteto": "0xF497FFEB"
-}
+def carregar_banco():
+    """Carrega os dados do disco rígido. Se não existir, cria o Gênesis."""
+    if os.path.exists(DB_FILE):
+        try:
+            with open(DB_FILE, "r") as f:
+                return json.load(f)
+        except:
+            pass
+    # Estado inicial caso o ficheiro não exista
+    return {
+        "ledger": {"0xF497FFEB": 0.0},
+        "aliases": {"@arquiteto": "0xF497FFEB"}
+    }
+
+def salvar_banco():
+    """Guarda os dados no disco para sobreviverem ao reinício do servidor."""
+    with open(DB_FILE, "w") as f:
+        json.dump({"ledger": ledger, "aliases": aliases}, f, indent=4)
+
+# Inicializa as variáveis puxando do disco
+banco_dados = carregar_banco()
+ledger = banco_dados["ledger"]
+aliases = banco_dados["aliases"]
 
 # --- MODELOS DE DADOS ---
 class TransferRequest(BaseModel):
     remetente_hash: str
-    destinatario: str      # Agora pode receber '0xABC...' ou '@Nome'
+    destinatario: str
     quantidade: float
 
 class MineRequest(BaseModel):
@@ -32,9 +51,11 @@ class AliasRequest(BaseModel):
 # --- ROTINA DO ARQUITETO ---
 def genesis_yield():
     arquiteto = "0xF497FFEB"
-    if arquiteto in ledger:
-        ledger[arquiteto] += 1.0
-        print(f"[ZION CORE] 1.0 SNG injetado. Saldo Arquiteto: {ledger[arquiteto]}")
+    if arquiteto not in ledger:
+        ledger[arquiteto] = 0.0
+    ledger[arquiteto] += 1.0
+    salvar_banco() # Salva a injeção
+    print(f"[ZION CORE] 1.0 SNG injetado. Saldo Arquiteto: {ledger[arquiteto]}")
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(genesis_yield, 'interval', hours=1)
@@ -43,14 +64,14 @@ scheduler.start()
 # --- ENDPOINTS ---
 @app.get("/")
 def status_rede():
-    return {"status": "Zion API V2 Online", "modules": ["PoHW", "Banking", "Aliases"]}
+    return {"status": "Zion API V2.1 Online", "modules": ["PoHW", "Banking", "Persistence"]}
 
 @app.get("/saldo/{wallet_hash}")
 def consultar_saldo(wallet_hash: str):
     if wallet_hash not in ledger:
         ledger[wallet_hash] = 0.0
+        salvar_banco()
     
-    # Procura se esta carteira tem um @Username registrado
     user_alias = "Desconhecido"
     for nome, h in aliases.items():
         if h == wallet_hash:
@@ -65,54 +86,48 @@ def registar_mineracao(req: MineRequest):
     if req.wallet_hash not in ledger: ledger[req.wallet_hash] = 0.0
         
     ledger[req.wallet_hash] += req.recompensa
+    salvar_banco() # <-- SALVA NO DISCO
+    
+    print(f"[POHW VALIDADO] {req.recompensa} SNG para {req.wallet_hash}")
     return {"status": "Bloco Validado", "novo_saldo": ledger[req.wallet_hash]}
 
 @app.post("/registrar_alias")
 def registrar_alias(req: AliasRequest):
     username = req.username.strip().lower()
-    
-    # Garante que começa com @
-    if not username.startswith("@"):
-        username = "@" + username
+    if not username.startswith("@"): username = "@" + username
         
-    # Verifica se o nome já está em uso por OUTRA pessoa
     if username in aliases and aliases[username] != req.wallet_hash:
-        raise HTTPException(status_code=400, detail="Este Nome de Operador já pertence a outra pessoa.")
+        raise HTTPException(status_code=400, detail="Este Nome já pertence a outra pessoa.")
         
-    # Registra ou atualiza
     aliases[username] = req.wallet_hash
-    if req.wallet_hash not in ledger:
-        ledger[req.wallet_hash] = 0.0
+    if req.wallet_hash not in ledger: ledger[req.wallet_hash] = 0.0
         
-    print(f"[REGISTRO] A carteira {req.wallet_hash} agora é conhecida como {username}")
+    salvar_banco() # <-- SALVA NO DISCO
+    print(f"[REGISTRO] {req.wallet_hash} agora é {username}")
     return {"status": "Identidade Vinculada", "alias": username, "wallet": req.wallet_hash}
 
 @app.post("/transferir")
 def transferir_sng(req: TransferRequest):
     if req.quantidade <= 0:
-        raise HTTPException(status_code=400, detail="A quantidade deve ser maior que zero.")
+        raise HTTPException(status_code=400, detail="Quantidade inválida.")
     if req.remetente_hash not in ledger or ledger[req.remetente_hash] < req.quantidade:
         raise HTTPException(status_code=400, detail="Saldo insuficiente.")
 
-    destinatario_hash = req.destinatario
-    
-    # Se o remetente digitou um @Nome, o servidor converte para Hash
+    dest_hash = req.destinatario
     if req.destinatario.startswith("@"):
         busca = req.destinatario.lower()
         if busca not in aliases:
-            raise HTTPException(status_code=404, detail=f"O operador {req.destinatario} não existe.")
-        destinatario_hash = aliases[busca]
+            raise HTTPException(status_code=404, detail="Operador não encontrado.")
+        dest_hash = aliases[busca]
 
-    # Cria a carteira destino se for nova
-    if destinatario_hash not in ledger:
-        ledger[destinatario_hash] = 0.0
+    if dest_hash not in ledger: ledger[dest_hash] = 0.0
         
-    # Executa a matemática do Ledger
     ledger[req.remetente_hash] -= req.quantidade
-    ledger[destinatario_hash] += req.quantidade
+    ledger[dest_hash] += req.quantidade
     
-    print(f"[TRANSFERÊNCIA] {req.quantidade} SNG de {req.remetente_hash} para {destinatario_hash}")
-    return {"status": "Aprovado", "enviado": req.quantidade, "para": destinatario_hash}
+    salvar_banco() # <-- SALVA NO DISCO
+    print(f"[TRANSFERÊNCIA] {req.quantidade} SNG de {req.remetente_hash} para {dest_hash}")
+    return {"status": "Aprovado", "enviado": req.quantidade, "para": dest_hash}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
