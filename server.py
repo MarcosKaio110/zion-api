@@ -58,7 +58,7 @@ def register(user: UserAuth):
         }).execute()
         return {"status": "Registrado com sucesso!", "username": clean_name, "wallet_hash": nova_wallet}
     except Exception as e:
-        raise HTTPException(status_code=400, detail="Username já existe.")
+        raise HTTPException(status_code=400, detail=f"Erro Matrix: {str(e)}")
 
 @app.post("/auth/login")
 def login(user: UserAuth):
