@@ -1,133 +1,118 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from apscheduler.schedulers.background import BackgroundScheduler
+from passlib.context import CryptContext
+from supabase import create_client, Client
 import uvicorn
-import json
 import os
 
-app = FastAPI(title="Zion Gateway V2.1 - SNG Protocol")
+# --- CONFIGURAÇÃO DE SEGURANÇA (LGPD) ---
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# --- SISTEMA DE PERSISTÊNCIA (O DISCO RÍGIDO DA MATRIX) ---
-DB_FILE = "zion_db.json"
+# --- CONEXÃO SUPABASE ---
+SUPABASE_URL = "https://vnkmsteysjkqzeivhfij.supabase.co"
+SUPABASE_KEY = "sb_publishable_ws-6h46BFv0RXGDPTjmjsA_nuk-79RO"
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-def carregar_banco():
-    """Carrega os dados do disco rígido. Se não existir, cria o Gênesis."""
-    if os.path.exists(DB_FILE):
-        try:
-            with open(DB_FILE, "r") as f:
-                return json.load(f)
-        except:
-            pass
-    # Estado inicial caso o ficheiro não exista
-    return {
-        "ledger": {"0xF497FFEB": 0.0},
-        "aliases": {"@arquiteto": "0xF497FFEB"}
-    }
-
-def salvar_banco():
-    """Guarda os dados no disco para sobreviverem ao reinício do servidor."""
-    with open(DB_FILE, "w") as f:
-        json.dump({"ledger": ledger, "aliases": aliases}, f, indent=4)
-
-# Inicializa as variáveis puxando do disco
-banco_dados = carregar_banco()
-ledger = banco_dados["ledger"]
-aliases = banco_dados["aliases"]
+app = FastAPI(title="Zion Gateway V3.0 - Persistência Imortal")
 
 # --- MODELOS DE DADOS ---
-class TransferRequest(BaseModel):
-    remetente_hash: str
-    destinatario: str
-    quantidade: float
+class UserAuth(BaseModel):
+    wallet_hash: str
+    username: str
+    password: str
 
 class MineRequest(BaseModel):
     wallet_hash: str
     recompensa: float
 
-class AliasRequest(BaseModel):
-    wallet_hash: str
-    username: str
+class TransferRequest(BaseModel):
+    remetente_hash: str
+    destinatario: str # Pode ser @Username ou 0xHash
+    quantidade: float
 
-# --- ROTINA DO ARQUITETO ---
-def genesis_yield():
-    arquiteto = "0xF497FFEB"
-    if arquiteto not in ledger:
-        ledger[arquiteto] = 0.0
-    ledger[arquiteto] += 1.0
-    salvar_banco() # Salva a injeção
-    print(f"[ZION CORE] 1.0 SNG injetado. Saldo Arquiteto: {ledger[arquiteto]}")
+# --- FUNÇÕES AUXILIARES ---
+def hash_pass(password: str): 
+    return pwd_context.hash(password)
 
-scheduler = BackgroundScheduler()
-scheduler.add_job(genesis_yield, 'interval', hours=1)
-scheduler.start()
+def verify_pass(plain, hashed): 
+    return pwd_context.verify(plain, hashed)
 
-# --- ENDPOINTS ---
-@app.get("/")
-def status_rede():
-    return {"status": "Zion API V2.1 Online", "modules": ["PoHW", "Banking", "Persistence"]}
-
-@app.get("/saldo/{wallet_hash}")
-def consultar_saldo(wallet_hash: str):
-    if wallet_hash not in ledger:
-        ledger[wallet_hash] = 0.0
-        salvar_banco()
+# --- ROTAS DE AUTENTICAÇÃO ---
+@app.post("/auth/register")
+def register(user: UserAuth):
+    clean_name = user.username.lower()
+    if not clean_name.startswith("@"): 
+        clean_name = "@" + clean_name
     
-    user_alias = "Desconhecido"
-    for nome, h in aliases.items():
-        if h == wallet_hash:
-            user_alias = nome
-            break
-            
-    return {"wallet": wallet_hash, "saldo": ledger[wallet_hash], "alias": user_alias}
+    try:
+        supabase.table("usuarios").insert({
+            "wallet_hash": user.wallet_hash,
+            "username": clean_name,
+            "password_hash": hash_pass(user.password),
+            "saldo": 0.0
+        }).execute()
+        return {"status": "Registrado com sucesso!", "username": clean_name}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail="Username ou Wallet já existem.")
 
+@app.post("/auth/login")
+def login(user: UserAuth):
+    clean_name = user.username.lower()
+    if not clean_name.startswith("@"): 
+        clean_name = "@" + clean_name
+
+    res = supabase.table("usuarios").select("*").eq("username", clean_name).execute()
+    if not res.data: 
+        raise HTTPException(status_code=404, detail="Usuário não encontrado.")
+    
+    db_user = res.data[0]
+    if not verify_pass(user.password, db_user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Senha incorreta.")
+    
+    return {
+        "wallet_hash": db_user["wallet_hash"],
+        "username": db_user["username"],
+        "saldo": float(db_user["saldo"])
+    }
+
+# --- ROTAS DE ECONOMIA ---
 @app.post("/minerar")
-def registar_mineracao(req: MineRequest):
-    if req.recompensa <= 0: raise HTTPException(status_code=400, detail="Recompensa inválida.")
-    if req.wallet_hash not in ledger: ledger[req.wallet_hash] = 0.0
-        
-    ledger[req.wallet_hash] += req.recompensa
-    salvar_banco() # <-- SALVA NO DISCO
+def minerar(req: MineRequest):
+    res = supabase.table("usuarios").select("saldo").eq("wallet_hash", req.wallet_hash).execute()
+    if not res.data: 
+        raise HTTPException(status_code=404, detail="Usuário não encontrado.")
     
-    print(f"[POHW VALIDADO] {req.recompensa} SNG para {req.wallet_hash}")
-    return {"status": "Bloco Validado", "novo_saldo": ledger[req.wallet_hash]}
-
-@app.post("/registrar_alias")
-def registrar_alias(req: AliasRequest):
-    username = req.username.strip().lower()
-    if not username.startswith("@"): username = "@" + username
-        
-    if username in aliases and aliases[username] != req.wallet_hash:
-        raise HTTPException(status_code=400, detail="Este Nome já pertence a outra pessoa.")
-        
-    aliases[username] = req.wallet_hash
-    if req.wallet_hash not in ledger: ledger[req.wallet_hash] = 0.0
-        
-    salvar_banco() # <-- SALVA NO DISCO
-    print(f"[REGISTRO] {req.wallet_hash} agora é {username}")
-    return {"status": "Identidade Vinculada", "alias": username, "wallet": req.wallet_hash}
+    novo_saldo = float(res.data[0]["saldo"]) + req.recompensa
+    supabase.table("usuarios").update({"saldo": novo_saldo}).eq("wallet_hash", req.wallet_hash).execute()
+    return {"status": "Bloco validado", "novo_saldo": novo_saldo}
 
 @app.post("/transferir")
 def transferir_sng(req: TransferRequest):
-    if req.quantidade <= 0:
-        raise HTTPException(status_code=400, detail="Quantidade inválida.")
-    if req.remetente_hash not in ledger or ledger[req.remetente_hash] < req.quantidade:
+    # 1. Validar Remetente
+    rem = supabase.table("usuarios").select("saldo").eq("wallet_hash", req.remetente_hash).execute()
+    if not rem.data or float(rem.data[0]["saldo"]) < req.quantidade:
         raise HTTPException(status_code=400, detail="Saldo insuficiente.")
 
-    dest_hash = req.destinatario
+    # 2. Identificar Destinatário
+    target_hash = req.destinatario
     if req.destinatario.startswith("@"):
-        busca = req.destinatario.lower()
-        if busca not in aliases:
-            raise HTTPException(status_code=404, detail="Operador não encontrado.")
-        dest_hash = aliases[busca]
+        dest_res = supabase.table("usuarios").select("wallet_hash").eq("username", req.destinatario.lower()).execute()
+        if not dest_res.data: 
+            raise HTTPException(status_code=404, detail="Destinatário não existe.")
+        target_hash = dest_res.data[0]["wallet_hash"]
 
-    if dest_hash not in ledger: ledger[dest_hash] = 0.0
-        
-    ledger[req.remetente_hash] -= req.quantidade
-    ledger[dest_hash] += req.quantidade
+    # 3. Executar Transferência
+    novo_saldo_rem = float(rem.data[0]["saldo"]) - req.quantidade
     
-    salvar_banco() # <-- SALVA NO DISCO
-    print(f"[TRANSFERÊNCIA] {req.quantidade} SNG de {req.remetente_hash} para {dest_hash}")
-    return {"status": "Aprovado", "enviado": req.quantidade, "para": dest_hash}
+    dest_data = supabase.table("usuarios").select("saldo").eq("wallet_hash", target_hash).execute()
+    if not dest_data.data: 
+        raise HTTPException(status_code=404, detail="Erro no destino.")
+    novo_saldo_dest = float(dest_data[0]["saldo"]) + req.quantidade
+
+    supabase.table("usuarios").update({"saldo": novo_saldo_rem}).eq("wallet_hash", req.remetente_hash).execute()
+    supabase.table("usuarios").update({"saldo": novo_saldo_dest}).eq("wallet_hash", target_hash).execute()
+
+    return {"status": "Transferência Concluída", "de": req.remetente_hash, "para": target_hash}
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run("server:app", host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
